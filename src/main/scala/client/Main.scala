@@ -27,18 +27,31 @@ object Main extends App {
       }
 
   def decryptForever(token: Token)(implicit httpClient: Client[Task]): IO[Nothing, Unit] =
-    Pool.make(4, decryptionTask(token))
+    for {
+      queueRef <- Ref(List.empty[Password])
+      _        <- Pool.make(8, decryptionTask(token, queueRef)).attempt.void
+    } yield ()
 
-  def decryptionTask(token: Token)(implicit httpClient: Client[Task]): IO[Nothing, Unit] =
+  def decryptionTask(token: Token, queueRef: Ref[List[Password]])(
+    implicit httpClient: Client[Task]
+  ): IO[Throwable, Unit] =
     (for {
       decrypter         <- getDecrypter
-      password          <- getPassword(token)
-      decryptedPassword <- fullDecryption(password, decrypter)
+      password          <- passwordFromQueueOrNew(queueRef, token)
+      decryptedPassword <- fullDecryption(password, decrypter, queueRef)
       status            <- validatePassword(token, password.encryptedPassword, decryptedPassword)
       _                 <- putStrLn(s"Status for password: ${password.encryptedPassword}: ${status.code}")
     } yield ()).attempt.flatMap {
-      case Left(err) => putStrLn(s"Encountered error: $err")
+      case Left(err) => putStrLn(s"Encountered error: $err") *> IO.fail(err)
       case Right(_)  => IO.unit
+    }
+
+  def passwordFromQueueOrNew(queueRef: Ref[List[Password]], token: Token)(
+    implicit httpClient: Client[Task]
+  ): IO[Throwable, Password] =
+    queueRef.modify(queue => (queue.headOption, queue.drop(1))).flatMap {
+      case Some(failedPassword) => putStrLn(s"Restarting password $failedPassword") *> IO.point(failedPassword)
+      case None                 => putStrLn("Fetching new password from server") *> getPassword(token)
     }
 
   def getDecrypter: IO[Nothing, Decrypter] = IO.point(new Decrypter)
